@@ -118,8 +118,3 @@ MIT License
 - [Pillow](https://python-pillow.org/)
 - [pytesseract](https://github.com/madmaze/pytesseract)
 - [sentence-transformers](https://www.sbert.net/)
-
----
-
-**Copy and paste the above into your `README.md` file.**  
-Let me know if you want to add a project logo, usage GIF, or any other custom section!
