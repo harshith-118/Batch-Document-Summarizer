@@ -1,0 +1,11 @@
+streamlit
+pandas
+tiktoken
+openai
+sentence-transformers
+langchain
+nltk
+pdfplumber
+Pillow
+pytesseract
+openpyxl 
