@@ -15,9 +15,17 @@ from utils_pdf import extract_text_tables_images_from_pdf
 from utils_chunking import count_tokens, semantic_chunking, normal_chunking, batch_chunks
 from utils_db import ensure_summary_cache_table, get_cached_summary, cache_summary, save_chunks_to_db
 from utils_summarize import safe_summarize_batch, SYSTEM_PROMPT_DETAILED, sha256_hash
+from utils_db import (
+    ensure_document_tables,
+    store_document_info
+)
+import datetime
 
 # Setup logging
 setup_logging()
+
+import nltk
+nltk.download('punkt_tab')
 
 # Initialize API clients and models
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
@@ -25,7 +33,7 @@ st.set_page_config(page_title="Document Summarizer", layout="wide")
 st.title("📄 Batch Document Summarizer with OpenAI")
 
 # Constants
-MODEL_NAME = "gpt-4"
+MODEL_NAME = "gpt-4o"
 TOKEN_LIMIT = 10000
 SUMMARY_TOKEN_TARGET = 500
 CHUNK_SIZE = 1500
@@ -34,12 +42,6 @@ DISPERSION_THRESHOLD = 60
 
 # Initialize tokenizer and embedding model
 tokenizer = tiktoken.encoding_for_model(MODEL_NAME)
-
-@st.cache_resource
-def get_embedding_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-embedding_model = get_embedding_model()
 
 def summarize_map_reduce(chunks):
     """
@@ -52,7 +54,7 @@ def summarize_map_reduce(chunks):
     
     batches = batch_chunks(chunks, tokenizer, batch_token_limit=batch_token_limit)
     batch_summaries = []
-    
+
     for batch in batches:
         batch_text = "\n\n".join(batch)
         summary = safe_summarize_batch(
@@ -69,7 +71,7 @@ def summarize_map_reduce(chunks):
             client=client
         )
         batch_summaries.append(summary)
-        
+
     # Reduce step
     reduce_text = "\n\n".join(batch_summaries)
     final_summary = safe_summarize_batch(
@@ -95,47 +97,65 @@ def process_documents(files, progress_callback=None, status_callback=None):
     errors = []
     total_files = len(files)
 
+    ensure_document_tables()
     for idx, file in enumerate(files):
         try:
             if status_callback:
                 status_callback(f"Processing: `{file.name}` ({idx+1}/{total_files})")
             if progress_callback:
                 progress_callback((idx) / total_files)
-            
+
+            doc_start_time = time.time()
             with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
                 tmp_file.write(file.read())
                 tmp_path = tmp_file.name
 
-            start_time = time.time()
-            
+            doc_end_time = time.time()
+            upload_time = doc_end_time-doc_start_time  # For demo, use start time as upload time
+            file_size_kb = os.path.getsize(tmp_path) / 1024.0
+            timestamp = datetime.datetime.now().isoformat()
+
             # Text Extraction
             extract_start = time.time()
             text = extract_text_tables_images_from_pdf(tmp_path)
             extract_end = time.time()
-            
+            extract_time = extract_end - extract_start
+
             # Token counting and chunking decision
             token_count_val = count_tokens(text, tokenizer)
             chunk_start = time.time()
             dispersion = token_count_val / max(1, len(text.split(". ")))
             if token_count_val > TOKEN_LIMIT or dispersion > DISPERSION_THRESHOLD:
-                chunks = semantic_chunking(text, embedding_model, tokenizer, chunk_size=CHUNK_SIZE)
+                chunks = semantic_chunking(text, client, tokenizer, chunk_size=CHUNK_SIZE,distance_threshold=1.0)
                 chunking_type = "Semantic"
             else:
                 chunks = normal_chunking(text, tokenizer)
                 chunking_type = "Normal"
             chunk_end = time.time()
-            
+            chunking_time = chunk_end-chunk_start
             # Save chunks to DB for debugging
             save_chunks_to_db(chunks, file.name)
-            
+
             # Warn if a chunk exceeds model context window
             chunk_warnings = [f"Chunk {i} exceeds model context window." for i, chunk in enumerate(chunks) if count_tokens(chunk, tokenizer) > TOKEN_LIMIT]
             
             # Summarization
             summary_start = time.time()
             summary = summarize_map_reduce(chunks)
+            # summary=""
             summary_end = time.time()
-            
+            summary_time = summary_end-summary_start
+
+            store_document_info(
+                name=file.name,
+                size_kb=file_size_kb,
+                upload_time=upload_time,
+                extract_time=extract_time,
+                chunking_time= chunking_time,
+                summary_time = summary_time,
+                total_tokens=token_count_val,
+                timestamp=timestamp
+            )
             summaries.append({
                 "Filename": file.name,
                 "Token Count": token_count_val,
@@ -144,10 +164,10 @@ def process_documents(files, progress_callback=None, status_callback=None):
                 "Extraction Time (s)": round(extract_end - extract_start, 5),
                 "Chunking Time (s)": round(chunk_end - chunk_start, 5),
                 "Summarization Time (s)": round(summary_end - summary_start, 5),
-                "Total Time (s)": round(time.time() - start_time, 5),
+                "Total Time (s)": round(time.time() - doc_start_time, 5),
                 "Chunk Warnings": "\n".join(chunk_warnings)
             })
-            
+
             if progress_callback:
                 progress_callback((idx+1) / total_files)
             
@@ -179,33 +199,32 @@ if uploaded_files:
         
         def progress_callback(val):
             progress_bar.progress(val)
-            
+        
         def status_callback(msg):
             status_text.info(msg)
-            
+        
         with st.spinner("⏳ Processing documents..."):
             df_result, excel_path, errors = process_documents(uploaded_files, progress_callback, status_callback)
-            
+
         progress_bar.empty()
         status_text.empty()
         st.success("✅ Summarization complete!")
-        
-        for idx, row in df_result.iterrows():
-            with st.expander(f"📄 {row['Filename']}"):
-                st.markdown(f"**Chunking Type:** {row['Chunking Type']}")
-                st.markdown("#### ⏱️ Time Taken (seconds)")
-                st.markdown(f"- **Extraction:** {row['Extraction Time (s)']}")
-                st.markdown(f"- **Chunking:** {row['Chunking Time (s)']}")
-                st.markdown(f"- **Summarization:** {row['Summarization Time (s)']}")
-                st.markdown(f"- **Total:** {row['Total Time (s)']}")
-                if row['Chunk Warnings']:
-                    st.warning(row['Chunk Warnings'])
-                st.markdown("#### 📝 Summary")
-                st.write(row['Summary'])
-                
+        # for idx, row in df_result.iterrows():
+        #     with st.expander(f"📄 {row['Filename']}"):
+        #         st.markdown(f"**Chunking Type:** {row['Chunking Type']}")
+        #         st.markdown("#### ⏱️ Time Taken (seconds)")
+        #         st.markdown(f"- **Extraction:** {row['Extraction Time (s)']}")
+        #         st.markdown(f"- **Chunking:** {row['Chunking Time (s)']}")
+        #         st.markdown(f"- **Summarization:** {row['Summarization Time (s)']}")
+        #         st.markdown(f"- **Total:** {row['Total Time (s)']}")
+        #         if row['Chunk Warnings']:
+        #             st.warning(row['Chunk Warnings'])
+        #         st.markdown("#### 📝 Summary")
+        #         st.write(row['Summary'])
+
         if errors:
             st.error("Some files had errors:\n" + "\n".join(errors))
-            
+
         if excel_path:
             with open(excel_path, "rb") as f:
-                st.download_button("📥 Download Excel Report", data=f, file_name="summaries.xlsx") 
+                st.download_button("📥 Download Excel Report", data=f, file_name="summaries.xlsx")
